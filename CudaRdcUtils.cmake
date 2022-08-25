@@ -527,6 +527,38 @@ function(cuda_rdc_find_final_library OUTLIST flat_dependency_list)
   set(${OUTLIST} ${_final_result} PARENT_SCOPE)
 endfunction()
 
+#  Check which CUDA runtime is need for a give (depend) library.
+function(cuda_rdc_check_cuda_runtime OUTVAR library)
+
+  get_target_property(_runtime_setting ${library} CUDA_RUNTIME_LIBRARY)
+  if (NOT _runtime_setting)
+    # We could get more exact information by using:
+    #  file(GET_RUNTIME_DEPENDENCIES LIBRARIES ${_lib_loc} UNRESOLVED_DEPENDENCIES_VAR _lib_dependcies)
+    # but we get
+    #   You have used file(GET_RUNTIME_DEPENDENCIES) in project mode.  This is
+    #     probably not what you intended to do.
+    # On the other hand, if the library is using (relocatable) CUDA code and
+    # the shared run-time library and we don't have the scafolding libraries
+    # (shared/static/final) then this won't work well. i.e. if we were to detect this
+    # case we probably need to 'error out'.
+    get_target_property(_cuda_library_type ${library} CUDA_RDC_LIBRARY_TYPE)
+    get_target_property(_cuda_find_library ${library} CUDA_RDC_FINAL_LIBRARY)
+    if ("${_cuda_library_type}" STREQUAL "Shared")
+      set_target_properties(${library} PROPERTIES CUDA_RUNTIME_LIBRARY "Shared")
+      set(_runtime_setting "Shared")
+    elseif(NOT _cuda_find_library)
+      set_target_properties(${library} PROPERTIES CUDA_RUNTIME_LIBRARY "None")
+      set(_runtime_setting "None")
+    else()
+      # If we have a final library then the library is shared.
+      set_target_properties(${library} PROPERTIES CUDA_RUNTIME_LIBRARY "Shared")
+      set(_runtime_setting "Shared")
+    endif()
+  endif()
+
+  set(${OUTVAR} ${_runtime_setting} PARENT_SCOPE)
+endfunction()
+
 # Replacement for target_link_libraries that is aware of
 # the 3 libraries (static, middle, final) libraries needed
 # for a separatable CUDA library
@@ -561,6 +593,9 @@ function(cuda_rdc_target_link_libraries target)
       cuda_rdc_use_middle_lib_in_property(${_target_object} LINK_LIBRARIES)
     endif()
 
+    cuda_rdc_cuda_gather_dependencies(_alldependencies ${target})
+    cuda_rdc_find_final_library(_finallibs "${_alldependencies}")
+
     get_target_property(_target_type ${target} TYPE)
     if("x${_target_type}" STREQUAL "xEXECUTABLE")
       cuda_rdc_cuda_gather_dependencies(_alldependencies ${target})
@@ -585,6 +620,12 @@ function(cuda_rdc_target_link_libraries target)
           CUDA_RESOLVE_DEVICE_SYMBOLS OFF
         )
         get_target_property(_final_target_type ${target} TYPE)
+
+        get_target_property(_final_runtime ${_finallibs} CUDA_RUNTIME_LIBRARY)
+        if ("${_final_runtime}" STREQUAL "Shared")
+          set_target_properties(${target} PROPERTIES CUDA_RUNTIME_LIBRARY "Shared")
+        endif()
+
         if("x${_final_target_type}" STREQUAL "xSTATIC_LIBRARY")
           # for static libraries we need to list the libraries a second time (to resolve symbol from the final library)
           get_target_property(_current_link_libraries ${target} LINK_LIBRARIES)
@@ -602,6 +643,7 @@ function(cuda_rdc_target_link_libraries target)
     endif()
 
     if(_contains_cuda)
+      set(_need_to_use_shared_runtime FALSE)
       get_target_property(_current_runtime_setting ${target} CUDA_RUNTIME_LIBRARY)
       if(_current_runtime_setting)
          set(_target_runtime_setting ${_current_runtime_setting})
@@ -610,7 +652,10 @@ function(cuda_rdc_target_link_libraries target)
       foreach(_lib ${_flat_target_link_libraries})
         get_target_property(_lib_target_type ${_lib} TYPE)
         if(NOT "x${_lib_target_type}" STREQUAL "xINTERFACE_LIBRARY")
-          get_target_property(_lib_runtime_setting ${_lib} CUDA_RUNTIME_LIBRARY)
+          cuda_rdc_check_cuda_runtime(_lib_runtime_setting ${_lib})
+          if (NOT ${_need_to_use_shared_runtime} AND ${_lib_runtime_setting} STREQUAL "Shared")
+            set(_need_to_use_shared_runtime TRUE)
+          endif()
           if(NOT _target_runtime_setting)
             if(_lib_runtime_setting)
               set(_target_runtime_setting ${_lib_runtime_setting})
@@ -643,6 +688,15 @@ function(cuda_rdc_target_link_libraries target)
           endif()
         endif()
       endforeach()
+
+      if (_need_to_use_shared_runtime)
+        get_target_property(_current_runtime ${target} CUDA_RUNTIME_LIBRARY)
+        if (NOT "${_current_runtime}" STREQUAL "Shared")
+          set_target_properties(${_target_middle} PROPERTIES CUDA_RUNTIME_LIBRARY "Shared")
+          set_target_properties(${_target_final} PROPERTIES CUDA_RUNTIME_LIBRARY "Shared")
+          set_target_properties(${_target_object} PROPERTIES CUDA_RUNTIME_LIBRARY "Shared")
+        endif()
+      endif()
     else() # We could restrict to the case where the dependent is a static library ... maybe
       set_target_properties(${target} PROPERTIES
         # If cmake detects that a library depends/uses a static library
@@ -653,6 +707,24 @@ function(cuda_rdc_target_link_libraries target)
         # Note: we might be able to move this to cuda_rdc_target_link_libraries
         CUDA_RESOLVE_DEVICE_SYMBOLS OFF
       )
+      if(NOT ${_target_type} STREQUAL "EXECUTABLE")
+        get_target_property(_current_runtime ${target} CUDA_RUNTIME_LIBRARY)
+        if(NOT "${_current_runtime}" STREQUAL "Shared")
+          set(_need_to_use_shared_runtime FALSE)
+          foreach(_lib ${_alldependencies})
+            cuda_rdc_check_cuda_runtime(_runtime ${_lib})
+            if (${_runtime} STREQUAL "Shared")
+              set(_need_to_use_shared_runtime TRUE)
+              break()
+            endif()
+          endforeach()
+          # We do not yet treat the case where the dependent library is Static
+          # and the current one is Shared.
+          if (${_need_to_use_shared_runtime})
+            set_target_properties(${target} PROPERTIES CUDA_RUNTIME_LIBRARY "Shared")
+          endif()
+        endif()
+      endif()
     endif()
   endif()
 
